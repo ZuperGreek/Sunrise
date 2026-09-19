@@ -66,6 +66,18 @@ constexpr std::int32_t kMaximumEntityCount = 65536;
 constexpr float kMaximumStepSeconds = 0.05F;
 /** Native velocity below this magnitude is treated as stationary. */
 constexpr float kMinimumVelocitySquared = 0.000001F;
+/** Lowest captured primary takeoff speed, conservatively below the observed 6.52 minimum. */
+constexpr float kPrimaryJumpMinimumVelocity = 4.0F;
+/** Lowest captured primary impulse delta, below the observed 6.64 minimum. */
+constexpr float kPrimaryJumpMinimumDelta = 4.0F;
+/** A consumed cycle rearms only when descent resolves to contact-scale velocity. */
+constexpr float kGroundMaximumVerticalSpeed = 0.75F;
+/** Ground motion must also be stable, rather than merely crossing an airborne apex. */
+constexpr float kGroundMaximumVerticalDelta = 0.10F;
+/** Initial attachment requires several stable samples before arming the modifier. */
+constexpr std::uint32_t kGroundConfirmationSteps = 3;
+/** A consumed cycle rearms only after a clear descent resolves to contact-scale velocity. */
+constexpr float kLandingMinimumDownwardSpeed = -1.0F;
 
 using HavokStep = std::int32_t(__fastcall*)(std::byte*, float);
 
@@ -102,10 +114,29 @@ FlyMeasure g_measure{};
 /** Entity count of the island that held the player on the last lookup. */
 std::int32_t g_playerIslandSize{};
 
-/** Body used to reset jump-phase state when the local player is recreated. */
-std::byte* g_jumpBody{};
-/** A jump is modified only when the body enters an upward-moving phase. */
-bool g_jumpAscending{};
+enum class PrimaryJumpPhase : std::uint8_t {
+    seekingGround,
+    armed,
+    consumed,
+};
+
+/** Local component/body pair proved by ownership and simulation-island membership. */
+struct LocalPlayerBody {
+    std::byte* component{};
+    std::byte* body{};
+};
+
+/** Jump lifecycle belonging to one proven local component/body pair. */
+struct JumpHeightRuntime {
+    std::byte* component{};
+    std::byte* body{};
+    float previousZ{};
+    std::uint32_t groundSamples{};
+    PrimaryJumpPhase phase{PrimaryJumpPhase::seekingGround};
+    bool previousValid{};
+};
+
+JumpHeightRuntime g_jumpHeight{};
 
 /** Views one field while its owning Havok object is live inside the simulation hook. */
 template <typename T> [[nodiscard]] T& field(std::byte* object, std::size_t offset) noexcept {
@@ -240,50 +271,95 @@ bounded_multiplier(float value, float minimum, float maximum, float fallback) no
 
 /** Drops jump-phase bookkeeping after the body is no longer usable. */
 void reset_jump_state() noexcept {
-    g_jumpBody = nullptr;
-    g_jumpAscending = false;
+    g_jumpHeight = JumpHeightRuntime{};
 }
 
-/** Applies the configured multiplier to the local body's upward jump impulse. */
-void apply_jump_height(std::byte* body, const client::movement::Settings& settings) noexcept {
-    if (body == nullptr) {
+/** Applies the multiplier only to a captured primary-jump impulse in an armed ground cycle. */
+void apply_jump_height(std::byte* component,
+                       std::byte* body,
+                       const client::movement::Settings& settings) noexcept {
+    if (body == nullptr || !settings.jumpHeightEnabled) {
         reset_jump_state();
         return;
     }
-    if (g_jumpBody != body) {
+    if (g_jumpHeight.component != component || g_jumpHeight.body != body) {
         reset_jump_state();
-        g_jumpBody = body;
+        g_jumpHeight.component = component;
+        g_jumpHeight.body = body;
+        // The resolver admits a body only after proving local ownership and island membership.
+        // That identity proof is the lifecycle boundary: history from an old body is discarded,
+        // while the new Guardian is ready for its first primary impulse without needing an old
+        // body's landing sequence.
+        g_jumpHeight.phase = PrimaryJumpPhase::armed;
     }
 
     auto& velocity = field<std::array<float, kVectorLanes>>(body, kBodyVelocity);
-    const bool ascending = velocity[kVertical] > 0.0F;
+    const float vertical = velocity[kVertical];
+    const float verticalDelta =
+        g_jumpHeight.previousValid ? vertical - g_jumpHeight.previousZ : 0.0F;
+    const bool stableGroundSample =
+        g_jumpHeight.previousValid && std::abs(vertical) <= kGroundMaximumVerticalSpeed
+        && std::abs(verticalDelta) <= kGroundMaximumVerticalDelta;
+    if (g_jumpHeight.phase == PrimaryJumpPhase::seekingGround) {
+        if (stableGroundSample) {
+            ++g_jumpHeight.groundSamples;
+            if (g_jumpHeight.groundSamples >= kGroundConfirmationSteps) {
+                g_jumpHeight.phase = PrimaryJumpPhase::armed;
+            }
+        } else {
+            g_jumpHeight.groundSamples = 0;
+        }
+    } else if (g_jumpHeight.phase == PrimaryJumpPhase::consumed) {
+        const bool landed = g_jumpHeight.previousValid
+                            && g_jumpHeight.previousZ <= kLandingMinimumDownwardSpeed
+                            && std::abs(vertical) <= kGroundMaximumVerticalSpeed;
+        if (landed) {
+            g_jumpHeight.phase = PrimaryJumpPhase::armed;
+            g_jumpHeight.groundSamples = 0;
+        }
+    }
+
+    const bool primaryClassified =
+        g_jumpHeight.phase == PrimaryJumpPhase::armed && g_jumpHeight.previousValid
+        && vertical >= kPrimaryJumpMinimumVelocity
+        && verticalDelta >= kPrimaryJumpMinimumDelta;
     const float jumpHeight =
         bounded_multiplier(settings.jumpHeightMultiplier,
                            client::movement::kMinimumJumpHeightMultiplier,
                            client::movement::kMaximumJumpHeightMultiplier,
                            client::movement::kDefaultJumpHeightMultiplier);
-    if (settings.jumpHeightEnabled && ascending && !g_jumpAscending && jumpHeight != 1.0F) {
-        velocity[kVertical] *= jumpHeight;
+    if (primaryClassified) {
+        g_jumpHeight.phase = PrimaryJumpPhase::consumed;
+        if (jumpHeight != 1.0F) {
+            velocity[kVertical] *= jumpHeight;
+        }
     }
-    g_jumpAscending = ascending;
+    g_jumpHeight.previousZ = vertical;
+    g_jumpHeight.previousValid = true;
 }
 
 /**
- * Finds the local player's rigid body in this simulation. Enemies share the character motion
- * type, so only the body of the player's own physics component is taken.
+ * Proves and finds the local player's rigid body in this simulation. Enemies share the character
+ * motion type, so only the body of the player's current owned physics component is taken.
  * @param simulation Simulation being stepped.
- * @return The player's body, or null when this simulation does not hold it.
+ * @return The proven component/body pair, or an empty pair when this simulation does not hold it.
  */
-[[nodiscard]] std::byte* player_body(std::byte* simulation) noexcept {
+[[nodiscard]] LocalPlayerBody resolve_player_body(std::byte* simulation) noexcept {
     if (simulation == nullptr) {
-        return nullptr;
+        return {};
     }
-    // The cached component may be stale. The pointer is only used once an island holds it.
-    std::byte* const target =
-        static_cast<std::byte*>(teleport::body(client::player::position::component()));
+    std::byte* const component =
+        static_cast<std::byte*>(client::player::position::component());
+    if (component == nullptr || !teleport::owns_local_player(component)) {
+        return {};
+    }
+    std::byte* const body = static_cast<std::byte*>(teleport::body(component));
+    if (body == nullptr) {
+        return {};
+    }
     std::byte* const world = field<std::byte*>(simulation, kSimulationWorld);
-    if (target == nullptr || world == nullptr) {
-        return nullptr;
+    if (world == nullptr) {
+        return {};
     }
     for (const std::size_t offset : kWorldIslandArrays) {
         const HavokArray& islands = field<HavokArray>(world, offset);
@@ -291,12 +367,12 @@ void apply_jump_height(std::byte* body, const client::movement::Settings& settin
             continue;
         }
         for (std::int32_t index = 0; index < islands.size; ++index) {
-            if (island_holds(islands.entries[index], target)) {
-                return target;
+            if (island_holds(islands.entries[index], body)) {
+                return LocalPlayerBody{component, body};
             }
         }
     }
-    return nullptr;
+    return {};
 }
 
 /**
@@ -349,15 +425,15 @@ std::int32_t __fastcall havok_step(std::byte* simulation, float deltaTime) noexc
     const bool enabledBeforeStep = poll_toggle();
     const bool flying = fly::enabled();
     const client::movement::Settings movementSettings = client::movement::get();
-    const bool modifierState = g_jumpAscending;
-    const bool needsBody = enabledBeforeStep || flying || movementSettings.jumpHeightEnabled
-                           || modifierState;
-    std::byte* const before = needsBody ? player_body(simulation) : nullptr;
-    if (before != nullptr && !flying && !enabledBeforeStep
-        && (movementSettings.jumpHeightEnabled || modifierState)) {
-        apply_jump_height(before, movementSettings);
-    } else if (before == nullptr && modifierState) {
+    if (!movementSettings.jumpHeightEnabled || flying || enabledBeforeStep) {
         reset_jump_state();
+    }
+    const bool needsBody = enabledBeforeStep || flying || movementSettings.jumpHeightEnabled;
+    const LocalPlayerBody localBody =
+        needsBody ? resolve_player_body(simulation) : LocalPlayerBody{};
+    std::byte* const before = localBody.body;
+    if (before != nullptr && !flying && !enabledBeforeStep && movementSettings.jumpHeightEnabled) {
+        apply_jump_height(localBody.component, before, movementSettings);
     }
     // Fly writes first, so the velocity read below is the one it asked for.
     if (flying) {
@@ -380,8 +456,9 @@ std::int32_t __fastcall havok_step(std::byte* simulation, float deltaTime) noexc
     const HavokStep next = reinterpret_cast<HavokStep>(g_stepHandle.original);
     const std::int32_t result = next != nullptr ? next(simulation, deltaTime) : 0;
 
-    // The body is resolved once here for both features.
-    std::byte* const body = (enabledBeforeStep || flying) ? player_body(simulation) : nullptr;
+    const LocalPlayerBody afterBody =
+        (enabledBeforeStep || flying) ? resolve_player_body(simulation) : LocalPlayerBody{};
+    std::byte* const body = afterBody.body;
     // A character created or replaced during this step has no matching before-state.
     const bool sameBody = hasBody && body == before;
     // Re-read after the step, so a toggle from the interface thread lands before a position write.
