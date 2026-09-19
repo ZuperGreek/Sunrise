@@ -18,6 +18,8 @@
 
 #include "../../../core/logging/log.h"
 #include "../../../core/ui/runtime/ui_visibility_runtime.h"
+#include "../../../state/account/account_state.h"
+#include "../../../state/runtime/runtime.h"
 #include "../../hooking/detour.h"
 #include "../../input/window_focus.h"
 #include "../../movement/movement_settings_store.h"
@@ -78,6 +80,13 @@ constexpr float kGroundMaximumVerticalDelta = 0.10F;
 constexpr std::uint32_t kGroundConfirmationSteps = 3;
 /** A consumed cycle rearms only after a clear descent resolves to contact-scale velocity. */
 constexpr float kLandingMinimumDownwardSpeed = -1.0F;
+/** Hunter aerial input can collapse an elevated positive Z before this hook sees the body. */
+constexpr float kHunterAerialMinimumPreviousVelocity = 2.0F;
+constexpr float kHunterAerialMinimumCurrentVelocity = -0.5F;
+constexpr float kHunterAerialMaximumCurrentVelocity = 2.5F;
+constexpr float kHunterAerialMinimumVelocityDrop = 2.0F;
+/** Native-scale Hunter aerial-jump velocity restored after the proven collapse signature. */
+constexpr float kHunterAerialRecoveryVelocity = 8.5F;
 
 using HavokStep = std::int32_t(__fastcall*)(std::byte*, float);
 
@@ -274,7 +283,20 @@ void reset_jump_state() noexcept {
     g_jumpHeight = JumpHeightRuntime{};
 }
 
-/** Applies the multiplier only to a captured primary-jump impulse in an armed ground cycle. */
+/** @return True when the account state identifies the selected character as a Hunter. */
+[[nodiscard]] bool selected_character_is_hunter() noexcept {
+    const state::AccountState account = state::account_snapshot();
+    const std::size_t count = (std::min)(account.characterCount, account.characters.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        const state::CharacterState& character = account.characters[index];
+        if (character.selected) {
+            return character.characterClass == state::CharacterClass::hunter;
+        }
+    }
+    return false;
+}
+
+/** Applies the primary multiplier and the narrow post-primary Hunter aerial compatibility repair. */
 void apply_jump_height(std::byte* component,
                        std::byte* body,
                        const client::movement::Settings& settings) noexcept {
@@ -310,6 +332,7 @@ void apply_jump_height(std::byte* component,
             g_jumpHeight.groundSamples = 0;
         }
     } else if (g_jumpHeight.phase == PrimaryJumpPhase::consumed) {
+        // Aerial stages do not rearm the ground cycle; only clear descent to contact does.
         const bool landed = g_jumpHeight.previousValid
                             && g_jumpHeight.previousZ <= kLandingMinimumDownwardSpeed
                             && std::abs(vertical) <= kGroundMaximumVerticalSpeed;
@@ -319,6 +342,7 @@ void apply_jump_height(std::byte* component,
         }
     }
 
+    // Contact corrections stay below both primary thresholds and cannot consume the cycle.
     const bool primaryClassified =
         g_jumpHeight.phase == PrimaryJumpPhase::armed && g_jumpHeight.previousValid
         && vertical >= kPrimaryJumpMinimumVelocity
@@ -333,6 +357,16 @@ void apply_jump_height(std::byte* component,
         if (jumpHeight != 1.0F) {
             velocity[kVertical] *= jumpHeight;
         }
+    } else if (jumpHeight > 1.0F && g_jumpHeight.phase == PrimaryJumpPhase::consumed
+               && g_jumpHeight.previousValid
+               && g_jumpHeight.previousZ >= kHunterAerialMinimumPreviousVelocity
+               && vertical >= kHunterAerialMinimumCurrentVelocity
+               && vertical <= kHunterAerialMaximumCurrentVelocity
+               && g_jumpHeight.previousZ - vertical >= kHunterAerialMinimumVelocityDrop
+               && selected_character_is_hunter()) {
+        // Hunter aerial input can replace an elevated ascent with a near-zero Z before Havok.
+        // Restore one native-scale aerial impulse without multiplying or rearming the ground jump.
+        velocity[kVertical] = kHunterAerialRecoveryVelocity;
     }
     g_jumpHeight.previousZ = vertical;
     g_jumpHeight.previousValid = true;
