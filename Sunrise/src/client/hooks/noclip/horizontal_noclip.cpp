@@ -102,6 +102,11 @@ FlyMeasure g_measure{};
 /** Entity count of the island that held the player on the last lookup. */
 std::int32_t g_playerIslandSize{};
 
+/** Body used to reset jump-phase state when the local player is recreated. */
+std::byte* g_jumpBody{};
+/** A jump is modified only when the body enters an upward-moving phase. */
+bool g_jumpAscending{};
+
 /** Views one field while its owning Havok object is live inside the simulation hook. */
 template <typename T> [[nodiscard]] T& field(std::byte* object, std::size_t offset) noexcept {
     return *reinterpret_cast<T*>(object + offset);
@@ -227,6 +232,42 @@ void measure_fly(
     g_measure.windowStart = now;
 }
 
+/** Clamps a runtime multiplier even when a caller bypassed the settings parser. */
+[[nodiscard]] float
+bounded_multiplier(float value, float minimum, float maximum, float fallback) noexcept {
+    return std::isfinite(value) ? std::clamp(value, minimum, maximum) : fallback;
+}
+
+/** Drops jump-phase bookkeeping after the body is no longer usable. */
+void reset_jump_state() noexcept {
+    g_jumpBody = nullptr;
+    g_jumpAscending = false;
+}
+
+/** Applies the configured multiplier to the local body's upward jump impulse. */
+void apply_jump_height(std::byte* body, const client::movement::Settings& settings) noexcept {
+    if (body == nullptr) {
+        reset_jump_state();
+        return;
+    }
+    if (g_jumpBody != body) {
+        reset_jump_state();
+        g_jumpBody = body;
+    }
+
+    auto& velocity = field<std::array<float, kVectorLanes>>(body, kBodyVelocity);
+    const bool ascending = velocity[kVertical] > 0.0F;
+    const float jumpHeight =
+        bounded_multiplier(settings.jumpHeightMultiplier,
+                           client::movement::kMinimumJumpHeightMultiplier,
+                           client::movement::kMaximumJumpHeightMultiplier,
+                           client::movement::kDefaultJumpHeightMultiplier);
+    if (settings.jumpHeightEnabled && ascending && !g_jumpAscending && jumpHeight != 1.0F) {
+        velocity[kVertical] *= jumpHeight;
+    }
+    g_jumpAscending = ascending;
+}
+
 /**
  * Finds the local player's rigid body in this simulation. Enemies share the character motion
  * type, so only the body of the player's own physics component is taken.
@@ -307,7 +348,17 @@ std::int32_t __fastcall havok_step(std::byte* simulation, float deltaTime) noexc
     std::array<float, kVectorLanes> nativePosition{};
     const bool enabledBeforeStep = poll_toggle();
     const bool flying = fly::enabled();
-    std::byte* const before = (enabledBeforeStep || flying) ? player_body(simulation) : nullptr;
+    const client::movement::Settings movementSettings = client::movement::get();
+    const bool modifierState = g_jumpAscending;
+    const bool needsBody = enabledBeforeStep || flying || movementSettings.jumpHeightEnabled
+                           || modifierState;
+    std::byte* const before = needsBody ? player_body(simulation) : nullptr;
+    if (before != nullptr && !flying && !enabledBeforeStep
+        && (movementSettings.jumpHeightEnabled || modifierState)) {
+        apply_jump_height(before, movementSettings);
+    } else if (before == nullptr && modifierState) {
+        reset_jump_state();
+    }
     // Fly writes first, so the velocity read below is the one it asked for.
     if (flying) {
         fly::before_step(before);
@@ -448,6 +499,7 @@ void uninstall() noexcept {
     g_stepHandle = {};
     // The switch is a stored setting, so detaching clears only the key state.
     g_toggleDown.store(false, std::memory_order_release);
+    reset_jump_state();
 }
 
 /** Reads a live rigid body's world position. */
